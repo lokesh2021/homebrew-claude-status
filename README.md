@@ -65,22 +65,6 @@ Add to `~/.claude/settings.json`:
 
 Open a new Claude Code session — the status line appears at the bottom automatically.
 
-## Input waiting alert
-
-When Claude finishes a response and is waiting for your input, the terminal window title alternates between:
-
-```
-⏳ Waiting — Claude Code
-```
-and
-```
-Claude Code
-```
-
-A bell also fires once at the start to draw your attention. The blinking stops the moment you submit your next message. This also works mid-conversation when Claude asks you a question via `AskUserQuestion`.
-
-The alert is set up automatically by `install.sh` via four Claude Code hooks (`Stop`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`). No extra configuration is needed.
-
 ## Usage reports
 
 ```bash
