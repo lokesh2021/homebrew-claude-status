@@ -5,30 +5,37 @@ class ClaudeStatus < Formula
   url "https://github.com/lokesh2021/homebrew-claude-status/archive/refs/tags/v1.0.0.tar.gz"
   sha256 "fd6e0acebbab9ec706a532f4c185f6d649380ac2c9135c12b63ed5e52edccc53"
   license "MIT"
-  version "1.0.0"
+  version "1.1.0"
 
   depends_on "jq"
 
   def install
     bin.install "bin/claude-status"
     bin.install "bin/claude-stats"
+    bin.install "bin/claude-blink"
   end
 
   def caveats
     <<~EOS
-      To activate the status line in Claude Code, add the following to
-      ~/.claude/settings.json:
+      To activate the status line and input-waiting alert in Claude Code,
+      add the following to ~/.claude/settings.json:
 
         {
-          "statusLine": {
-            "type": "command",
-            "command": "claude-status"
+          "statusCommand": "claude-status",
+          "hooks": {
+            "Stop":            [{"hooks": [{"type": "command", "command": "/opt/homebrew/bin/claude-blink"}]}],
+            "UserPromptSubmit":[{"hooks": [{"type": "command", "command": "/opt/homebrew/bin/claude-blink --stop"}]}],
+            "PreToolUse":      [{"matcher": "AskUserQuestion", "hooks": [{"type": "command", "command": "/opt/homebrew/bin/claude-blink"}]}],
+            "PostToolUse":     [{"matcher": "AskUserQuestion", "hooks": [{"type": "command", "command": "/opt/homebrew/bin/claude-blink --stop"}]}]
           }
         }
 
-      Then start a new Claude Code session. You should see a status line like:
+      Then start a new Claude Code session.  You should see a status line like:
 
         ⎇ main  ·  your-username  ·  sonnet-4-6  ·  $0.0012  ·  ↑5k ↓2k  ·  ctx [█░░░░░░░░░] 12%
+
+      The terminal title will blink ("⏳ Waiting — Claude Code") whenever
+      Claude finishes a response and is waiting for your input.
 
       View your usage statistics anytime:
 

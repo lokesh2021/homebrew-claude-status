@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# claude-blink — Flash terminal title when Claude awaits user input
+#
+# Modes:
+#   claude-blink            Start blinking (Stop / PreToolUse hooks)
+#   claude-blink --stop     Stop blinking  (UserPromptSubmit / PostToolUse hooks)
+#   claude-blink --loop <tty>  Internal background loop — do not call directly
+#
+# How it works:
+#   On start: sends one bell to the terminal, then spawns a detached background
+#   loop that alternates the window/tab title between "⏳ Waiting — Claude Code"
+#   and "Claude Code" every second.  The loop PID is saved to a temp file so
+#   --stop can kill it.
+#
+# Works with Terminal.app, iTerm2, and any xterm-compatible terminal.
+# Silently exits when no writable TTY is found (CI / piped sessions).
+
+set -uo pipefail
+
+PID_FILE="${TMPDIR:-/tmp}/claude-blink.pid"
+
+# ── Internal: background blink loop ──────────────────────────────────────────
+if [[ "${1:-}" == "--loop" ]]; then
+  TTY_DEV="${2:-/dev/tty}"
+  trap 'exit 0' TERM INT
+  toggle=0
+  while true; do
+    if (( toggle == 0 )); then
+      printf '\033]0;⏳ Waiting — Claude Code\007' > "$TTY_DEV" 2>/dev/null || exit 0
+      toggle=1
+    else
+      printf '\033]0;Claude Code\007' > "$TTY_DEV" 2>/dev/null || exit 0
+      toggle=0
+    fi
+    sleep 1
+  done
+  exit 0
+fi
+
+# ── Stop blinking ─────────────────────────────────────────────────────────────
+if [[ "${1:-}" == "--stop" ]]; then
+  if [[ -f "$PID_FILE" ]]; then
+    kill "$(cat "$PID_FILE")" 2>/dev/null || true
+    rm -f "$PID_FILE"
+  fi
+  # Clear the waiting title; the shell will set its own title on the next prompt
+  TTY_DEV=$(tty 2>/dev/null || echo /dev/tty)
+  [[ -w "$TTY_DEV" ]] && printf '\033]0;\007' > "$TTY_DEV" 2>/dev/null || true
+  exit 0
+fi
+
+# ── Start blinking ────────────────────────────────────────────────────────────
+
+# Kill any prior blink loop from the previous turn
+if [[ -f "$PID_FILE" ]]; then
+  kill "$(cat "$PID_FILE")" 2>/dev/null || true
+  rm -f "$PID_FILE"
+fi
+
+# Locate the controlling terminal — /dev/tty always points to it even when
+# stdout/stdin are redirected (which Claude Code does for hook commands)
+TTY_DEV=$(tty 2>/dev/null || echo /dev/tty)
+[[ ! -w "$TTY_DEV" ]] && exit 0
+
+# One-shot attention signal: bell causes a beep or screen flash depending on
+# the user's terminal settings
+printf '\a' > "$TTY_DEV" 2>/dev/null || true
+
+# Spawn the loop as a detached process so it survives after this hook exits
+"$0" --loop "$TTY_DEV" &
+BLINK_PID=$!
+echo "$BLINK_PID" > "$PID_FILE"
+disown "$BLINK_PID" 2>/dev/null || true
