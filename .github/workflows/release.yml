@@ -1,0 +1,60 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Compute SHA256 of GitHub source archive
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          ARCHIVE_URL="https://github.com/${{ github.repository }}/archive/refs/tags/${VERSION}.tar.gz"
+          curl -sL "$ARCHIVE_URL" -o source.tar.gz
+          SHA256=$(sha256sum source.tar.gz | awk '{print $1}')
+          echo "SHA256=${SHA256}" >> "$GITHUB_ENV"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+
+      - name: Update formula with real sha256 and version
+        run: |
+          sed -i "s|REPLACE_WITH_SHA256_AFTER_RELEASE|${SHA256}|g" Formula/claude-status.rb
+          # Update version and url if they reference a previous tag
+          sed -i "s|/tags/v[0-9]*\.[0-9]*\.[0-9]*\.tar\.gz|/tags/${VERSION}.tar.gz|g" Formula/claude-status.rb
+          sed -i "s|version \"[0-9]*\.[0-9]*\.[0-9]*\"|version \"${VERSION#v}\"|g" Formula/claude-status.rb
+
+      - name: Commit updated formula back to main
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/claude-status.rb
+          git commit -m "chore: update formula sha256 for ${VERSION}" || echo "No changes to commit"
+          git push origin HEAD:main
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body: |
+            ## Install via Homebrew
+
+            ```bash
+            brew tap ${{ github.repository_owner }}/claude-status
+            brew install claude-status
+            ```
+
+            ## Or install directly
+
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | bash
+            ```
+
+            ## SHA256
+            `${{ env.SHA256 }}`

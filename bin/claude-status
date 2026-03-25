@@ -1,0 +1,276 @@
+#!/usr/bin/env bash
+# claude-status — Claude Code status line script
+#
+# Reads JSON from stdin (provided by Claude Code on each response),
+# tracks usage data to disk, and outputs a formatted status string.
+# Colours are value-aware; layout adapts to terminal width.
+#
+# Dependencies: jq (required), git (optional), gh (optional)
+#
+# Install: brew tap YOUR_GITHUB_USERNAME/claude-status
+#          brew install claude-status
+# Then add to ~/.claude/settings.json:
+#   { "statusLine": { "type": "command", "command": "claude-status" } }
+
+set -uo pipefail
+
+# ── ANSI colours ──────────────────────────────────────────────────────────────
+R=$'\033[0m'        # reset
+BOLD=$'\033[1m'
+DIM=$'\033[2m'
+BRED=$'\033[91m'    # bright red    — critical
+BYELLOW=$'\033[93m' # bright yellow — warning
+BGREEN=$'\033[92m'  # bright green  — ok
+BCYAN=$'\033[96m'   # bright cyan   — branch
+WHITE=$'\033[97m'   # bright white  — model
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+DATA_DIR="${CLAUDE_STATUS_DATA_DIR:-$HOME/.local/share/claude-status}"
+CONFIG_FILE="$DATA_DIR/config.json"
+DATA_SUBDIR="$DATA_DIR/data"
+mkdir -p "$DATA_SUBDIR"
+
+# ── Guard: require jq ─────────────────────────────────────────────────────────
+if ! command -v jq &>/dev/null; then
+  echo "⚠ claude-status: jq not found (brew install jq)"
+  exit 0
+fi
+
+# ── Read + parse JSON input (single jq call for speed) ───────────────────────
+INPUT=$(cat)
+
+PARSED=$(echo "$INPUT" | jq -r '
+  [
+    (.model.display_name // ""),
+    (.cost.total_cost_usd        // 0 | tostring),
+    (.cost.total_duration_ms     // 0 | tostring),
+    (.context_window.used_percentage       // 0 | floor | tostring),
+    (.context_window.total_input_tokens    // 0 | tostring),
+    (.context_window.total_output_tokens   // 0 | tostring),
+    (.rate_limits.five_hour.used_percentage // 0 | floor | tostring),
+    (.rate_limits.seven_day.used_percentage // 0 | floor | tostring),
+    (.session_id // "")
+  ] | join("\t")
+' 2>/dev/null) || true
+
+if [[ -z "$PARSED" ]]; then
+  echo "⚠ claude-status: bad input"
+  exit 0
+fi
+
+IFS=$'\t' read -r MODEL COST DUR_MS CTX_PCT IN_TOK OUT_TOK RATE_5H RATE_7D SESSION_ID \
+  <<< "$PARSED"
+
+# ── Git branch (fast local operation, no network) ─────────────────────────────
+GIT_BRANCH=""
+if command -v git &>/dev/null && git rev-parse --is-inside-work-tree &>/dev/null 2>&1; then
+  GIT_BRANCH=$(git branch --show-current 2>/dev/null \
+    || git rev-parse --short HEAD 2>/dev/null \
+    || true)
+fi
+
+# ── GitHub username (cached for 7 days; only from `gh auth`, never git config) ─
+GH_USER=""
+CACHE_TTL=$(( 7 * 86400 ))
+if [[ -f "$CONFIG_FILE" ]]; then
+  CACHED_USER=$(jq -r '.github_username // ""' "$CONFIG_FILE" 2>/dev/null || true)
+  CACHED_TS=$(jq -r '.updated // 0'           "$CONFIG_FILE" 2>/dev/null || true)
+  NOW=$(date +%s)
+  if [[ -n "$CACHED_USER" ]] && (( NOW - CACHED_TS < CACHE_TTL )); then
+    GH_USER="$CACHED_USER"
+  fi
+fi
+
+if [[ -z "$GH_USER" ]] && command -v gh &>/dev/null; then
+  # Use the active account from gh auth status (respects multi-account setups)
+  GH_USER=$(gh auth status 2>/dev/null \
+    | grep -B3 'Active account: true' \
+    | grep 'Logged in to' \
+    | sed 's/.*account \([^ ]*\).*/\1/')
+  # Fallback to gh api user if auth status parsing yields nothing
+  [[ -z "$GH_USER" ]] && GH_USER=$(gh api user --jq '.login' 2>/dev/null || true)
+  if [[ -n "$GH_USER" ]]; then
+    printf '{"github_username":"%s","updated":%s}\n' \
+      "$GH_USER" "$(date +%s)" > "$CONFIG_FILE"
+  fi
+fi
+
+# ── Persist session data (append-log; deduped by session_id on read) ──────────
+if [[ -n "$SESSION_ID" ]]; then
+  TODAY=$(date +%Y-%m-%d)
+  EPOCH=$(date +%s)
+  printf '{"sid":"%s","date":"%s","ts":%s,"cost":%s,"in":%s,"out":%s,"dur":%s}\n' \
+    "$SESSION_ID" "$TODAY" "$EPOCH" \
+    "${COST:-0}" "${IN_TOK:-0}" "${OUT_TOK:-0}" "${DUR_MS:-0}" \
+    >> "$DATA_SUBDIR/${TODAY}.jsonl"
+fi
+
+# ── Terminal width ────────────────────────────────────────────────────────────
+# When Claude Code captures stdout there is no TTY on fd-1, so tput cols
+# returns the fallback (80). Read via /dev/tty to get the real width.
+TERM_WIDTH="${COLUMNS:-}"
+[[ "${TERM_WIDTH:-0}" -le 0 ]] && TERM_WIDTH=""
+if [[ -z "$TERM_WIDTH" ]]; then
+  # /dev/tty gives real width even when stdout is captured by Claude Code
+  TERM_WIDTH=$( { stty size </dev/tty; } 2>/dev/null | awk '{print $2}' )
+fi
+if [[ -z "$TERM_WIDTH" ]] && [[ -t 1 ]]; then
+  # Only trust tput cols when stdout is actually a terminal;
+  # without a TTY it always returns 80, masking the real width.
+  TERM_WIDTH=$(tput cols 2>/dev/null)
+fi
+# If width is still unknown (stdout captured, no /dev/tty), assume a wide
+# terminal and prefer single-line output.
+: "${TERM_WIDTH:=999}"
+
+# ── Format helpers ────────────────────────────────────────────────────────────
+fmt_tokens() {
+  local n="${1:-0}"; n="${n%.*}"; n="${n:-0}"
+  if   (( n >= 1000000 )); then printf "%dM" $(( n / 1000000 ))
+  elif (( n >= 1000    )); then printf "%dk" $(( n / 1000 ))
+  else printf "%d" "$n"
+  fi
+}
+
+fmt_cost() { printf "\$%.4f" "${1:-0}"; }
+
+fmt_duration() {
+  local ms="${1:-0}"; ms="${ms%.*}"; ms="${ms:-0}"
+  local s=$(( ms / 1000 ))
+  if   (( s >= 3600 )); then printf "%dh%dm" $(( s/3600 )) $(( (s%3600)/60 ))
+  elif (( s >= 60   )); then printf "%dm%ds" $(( s/60 ))   $(( s%60 ))
+  else printf "%ds" "$s"
+  fi
+}
+
+# Return colour code based on a percentage value
+pct_colour() {
+  local v="${1:-0}"; v="${v%.*}"; v="${v:-0}"
+  if   (( v >= 90 )); then printf "%s" "$BRED"
+  elif (( v >= 75 )); then printf "%s" "$BYELLOW"
+  else printf "%s" "$BGREEN"
+  fi
+}
+
+# Return colour code based on cost (USD)
+cost_colour() {
+  if   awk "BEGIN{exit !($1 >= 0.20)}"; then printf "%s" "$BRED"
+  elif awk "BEGIN{exit !($1 >= 0.05)}"; then printf "%s" "$BYELLOW"
+  else printf "%s" "$BGREEN"
+  fi
+}
+
+# Context-window progress bar: make_bar <pct> <bar_width>
+# Outputs coloured block characters: ████░░░░
+make_bar() {
+  local pct="${1:-0}"; pct="${pct%.*}"; pct="${pct:-0}"
+  local w="${2:-10}"
+  local filled=$(( pct * w / 100 ))
+  (( filled > w )) && filled=$w
+  local empty=$(( w - filled ))
+  local colour; colour=$(pct_colour "$pct")
+  local out="${colour}"
+  local i
+  for (( i=0; i<filled; i++ )); do out+="█"; done
+  out+="${DIM}"
+  for (( i=0; i<empty; i++ )); do out+="░"; done
+  out+="${R}"
+  printf "%s" "$out"
+}
+
+# Join non-empty segments with a dimmed separator
+join_segs() {
+  local sep="${DIM}  ·  ${R}"
+  local first=1 out=""
+  local seg
+  for seg in "$@"; do
+    [[ -z "$seg" ]] && continue
+    if (( first )); then out+="$seg"; first=0
+    else out+="${sep}${seg}"
+    fi
+  done
+  printf "%s" "$out"
+}
+
+# ── Normalise parsed values ───────────────────────────────────────────────────
+CTX="${CTX_PCT%.*}";  CTX="${CTX:-0}"
+RATE="${RATE_5H%.*}"; RATE="${RATE:-0}"
+RATE7="${RATE_7D%.*}"; RATE7="${RATE7:-0}"
+MODEL_SHORT="${MODEL#claude-}"
+
+# ── Build colour segments ─────────────────────────────────────────────────────
+
+SEG_BRANCH=""
+[[ -n "$GIT_BRANCH" ]] && SEG_BRANCH="${BCYAN}⎇ ${GIT_BRANCH}${R}"
+
+SEG_USER=""
+[[ -n "$GH_USER" ]] && SEG_USER="${DIM}${GH_USER}${R}"
+
+SEG_MODEL=""
+[[ -n "$MODEL_SHORT" ]] && SEG_MODEL="${BOLD}${WHITE}${MODEL_SHORT}${R}"
+
+CC=$(cost_colour "$COST")
+SEG_COST="${CC}$(fmt_cost "$COST")${R}"
+
+IN_FMT=$(fmt_tokens "$IN_TOK")
+OUT_FMT=$(fmt_tokens "$OUT_TOK")
+SEG_TOKENS="↑${IN_FMT} ↓${OUT_FMT}"
+
+DUR=$(fmt_duration "$DUR_MS")
+SEG_DUR=""
+[[ "$DUR" != "0s" ]] && SEG_DUR="${DIM}${DUR}${R}"
+
+SEG_RATE5=""
+if (( RATE > 0 )); then
+  RC=$(pct_colour "$RATE")
+  SEG_RATE5="${RC}5h:${RATE}%${R}"
+fi
+
+SEG_RATE7=""
+if (( RATE7 > 0 )); then
+  RC=$(pct_colour "$RATE7")
+  SEG_RATE7="${RC}7d:${RATE7}%${R}"
+fi
+
+# Context bar segment — bar_width is set per layout mode below
+ctx_seg() {
+  local bw="$1"
+  local bar; bar=$(make_bar "$CTX" "$bw")
+  local pc; pc=$(pct_colour "$CTX")
+  printf "ctx [%s] %s%d%%%s" "$bar" "$pc" "$CTX" "$R"
+}
+
+# Strip ANSI escape codes and return visible character count.
+# Uses bytes-minus-UTF8-continuation-bytes so it is locale-independent
+# (wc -m counts bytes instead of chars in a C locale, causing false overflow).
+visible_len() {
+  local stripped
+  stripped=$(printf "%s" "$1" | sed $'s/\x1b\\[[0-9;]*m//g')
+  local total cont
+  total=$(printf "%s" "$stripped" | LC_ALL=C wc -c | tr -d ' \n')
+  # continuation bytes (0x80–0xBF) are the 2nd/3rd bytes of multibyte chars;
+  # LC_ALL=C forces byte-by-byte processing on macOS
+  cont=$(printf "%s" "$stripped" | LC_ALL=C tr -dc $'\x80-\xbf' | LC_ALL=C wc -c | tr -d ' \n')
+  printf "%d" $(( total - cont ))
+}
+
+# ── Layout ────────────────────────────────────────────────────────────────────
+#
+# Single line when it fits; two lines only when the terminal is too narrow.
+#   Single — ⎇ branch  ·  user  ·  model  ·  $cost  ·  ↑in ↓out  ·  ctx [████░] 40%  ·  5h:x%  ·  7d:x%  ·  dur
+#   Line 1 — model  ·  $cost  ·  ↑in ↓out  ·  dur
+#   Line 2 — ⎇ branch  ·  user  ·  ctx [███████████████░░░░░] 75%  ·  5h:x%  ·  7d:x%
+
+CTX_SEG=$(ctx_seg 10)
+SINGLE=$(join_segs "$SEG_BRANCH" "$SEG_USER" "$SEG_MODEL" \
+         "$SEG_COST" "$SEG_TOKENS" \
+         "$CTX_SEG" "$SEG_RATE5" "$SEG_RATE7" "$SEG_DUR")
+
+if (( $(visible_len "$SINGLE") <= TERM_WIDTH )); then
+  printf "%s\n" "$SINGLE"
+else
+  LINE1=$(join_segs "$SEG_MODEL" "$SEG_COST" "$SEG_TOKENS" "$SEG_DUR")
+  CTX_SEG=$(ctx_seg 15)
+  LINE2=$(join_segs "$SEG_BRANCH" "$SEG_USER" "$CTX_SEG" "$SEG_RATE5" "$SEG_RATE7")
+  printf "%s\n%s\n" "$LINE1" "$LINE2"
+fi

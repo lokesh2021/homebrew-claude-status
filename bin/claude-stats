@@ -1,0 +1,397 @@
+#!/usr/bin/env bash
+# claude-stats — Claude Code usage statistics reporter
+#
+# Reads the session data written by claude-status and aggregates it.
+#
+# Usage:
+#   claude-stats            — today + week + month summary
+#   claude-stats today      — today only
+#   claude-stats week       — last 7 days
+#   claude-stats month      — last 30 days
+#   claude-stats history    — last 20 sessions
+#   claude-stats history N  — last N sessions
+#   claude-stats all        — all-time totals
+#   claude-stats reset      — wipe all stored data (with confirmation)
+
+set -uo pipefail
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+DATA_DIR="${CLAUDE_STATUS_DATA_DIR:-$HOME/.local/share/claude-status}"
+DATA_SUBDIR="$DATA_DIR/data"
+
+# ── Guard: require jq ─────────────────────────────────────────────────────────
+if ! command -v jq &>/dev/null; then
+  echo "Error: jq is required. Install with: brew install jq" >&2
+  exit 1
+fi
+
+# ── Colors ────────────────────────────────────────────────────────────────────
+if [[ -t 1 ]]; then
+  BOLD="\033[1m"; DIM="\033[2m"; RESET="\033[0m"
+  GREEN="\033[32m"; YELLOW="\033[33m"; CYAN="\033[36m"; BLUE="\033[34m"
+  MAGENTA="\033[35m"; RED="\033[31m"
+else
+  BOLD=""; DIM=""; RESET=""
+  GREEN=""; YELLOW=""; CYAN=""; BLUE=""; MAGENTA=""; RED=""
+fi
+
+# ── Date helpers (BSD macOS + GNU Linux compatible) ───────────────────────────
+days_ago() {
+  local n=$1
+  if [[ "$(uname)" == "Darwin" ]]; then
+    date -v-"${n}"d +%Y-%m-%d
+  else
+    date -d "-${n} days" +%Y-%m-%d
+  fi
+}
+
+start_of_month() {
+  if [[ "$(uname)" == "Darwin" ]]; then
+    date -v1d +%Y-%m-%d
+  else
+    date -d "$(date +%Y-%m-01)" +%Y-%m-%d
+  fi
+}
+
+today_date() { date +%Y-%m-%d; }
+now_epoch()  { date +%s; }
+
+# ── Get list of date files within a range ─────────────────────────────────────
+# Returns filenames that exist for the given date strings
+files_for_dates() {
+  local dates=("$@")
+  local files=()
+  for d in "${dates[@]}"; do
+    local f="$DATA_SUBDIR/${d}.jsonl"
+    [[ -f "$f" ]] && files+=("$f")
+  done
+  printf '%s\n' "${files[@]}"
+}
+
+# ── Collect all unique .jsonl files (for all-time) ────────────────────────────
+all_files() {
+  [[ -d "$DATA_SUBDIR" ]] || return 0
+  find "$DATA_SUBDIR" -name "*.jsonl" | sort
+}
+
+# ── Aggregate JSONL input: dedup by session_id (last entry wins), then sum ────
+# Reads file paths from $1 (newline-separated), outputs JSON summary
+aggregate_files() {
+  local file_list="$1"
+  local files=()
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && files+=("$line")
+  done <<< "$file_list"
+
+  if [[ ${#files[@]} -eq 0 ]]; then
+    echo '{"sessions":0,"cost":0,"in_tokens":0,"out_tokens":0,"total_tokens":0}'
+    return
+  fi
+
+  cat "${files[@]}" | jq -rs '
+    # Dedup by session id — last entry per sid wins
+    group_by(.sid)
+    | map(last)
+    | {
+        sessions:     length,
+        cost:         (map(.cost // 0) | add // 0),
+        in_tokens:    (map(.in   // 0) | add // 0),
+        out_tokens:   (map(.out  // 0) | add // 0),
+        total_tokens: (map((.in // 0) + (.out // 0)) | add // 0)
+      }
+  '
+}
+
+# ── Format numbers ────────────────────────────────────────────────────────────
+fmt_cost() {
+  printf "\$%.4f" "${1:-0}"
+}
+
+fmt_tokens() {
+  local n="${1:-0}"
+  # jq outputs floats sometimes; strip decimal
+  n="${n%.*}"
+  n="${n:-0}"
+  # Add comma separators (portable)
+  printf "%'d" "$n" 2>/dev/null || printf "%d" "$n"
+}
+
+fmt_pct_bar() {
+  local pct="${1:-0}"
+  local width=20
+  local filled=$(( pct * width / 100 ))
+  local empty=$(( width - filled ))
+  printf "["
+  printf "%0.s█" $(seq 1 $filled) 2>/dev/null || printf "%${filled}s" | tr ' ' '█'
+  printf "%0.s░" $(seq 1 $empty)  2>/dev/null || printf "%${empty}s"  | tr ' ' '░'
+  printf "] %d%%" "$pct"
+}
+
+# ── Print a stats block ───────────────────────────────────────────────────────
+print_block() {
+  local label="$1"
+  local json="$2"
+  local color="$3"
+
+  local sessions cost in_tok out_tok total_tok
+  sessions=$(echo "$json"  | jq -r '.sessions')
+  cost=$(echo "$json"      | jq -r '.cost')
+  in_tok=$(echo "$json"    | jq -r '.in_tokens')
+  out_tok=$(echo "$json"   | jq -r '.out_tokens')
+  total_tok=$(echo "$json" | jq -r '.total_tokens')
+
+  echo -e "${BOLD}${color}${label}${RESET}"
+  echo -e "  ${DIM}Sessions   ${RESET}  ${sessions}"
+  echo -e "  ${DIM}Cost       ${RESET}  ${BOLD}$(fmt_cost "$cost")${RESET}"
+  echo -e "  ${DIM}Input      ${RESET}  $(fmt_tokens "$in_tok") tokens"
+  echo -e "  ${DIM}Output     ${RESET}  $(fmt_tokens "$out_tok") tokens"
+  echo -e "  ${DIM}Total      ${RESET}  ${BOLD}$(fmt_tokens "$total_tok") tokens${RESET}"
+}
+
+# ── Header ────────────────────────────────────────────────────────────────────
+print_header() {
+  echo ""
+  echo -e "${BOLD}${CYAN}  Claude Code Usage${RESET}  ${DIM}· data: $DATA_SUBDIR${RESET}"
+  echo -e "${DIM}  $(printf '%.0s─' {1..52})${RESET}"
+}
+
+print_divider() {
+  echo -e "${DIM}  $(printf '%.0s─' {1..52})${RESET}"
+}
+
+# ── Subcommands ───────────────────────────────────────────────────────────────
+
+cmd_today() {
+  local today
+  today=$(today_date)
+  local files
+  files=$(files_for_dates "$today")
+  local result
+  result=$(aggregate_files "$files")
+  print_header
+  print_block "  Today  (${today})" "$result" "$GREEN"
+  echo ""
+}
+
+cmd_week() {
+  local dates=()
+  for i in $(seq 0 6); do
+    dates+=("$(days_ago "$i")")
+  done
+  local files
+  files=$(files_for_dates "${dates[@]}")
+  local result
+  result=$(aggregate_files "$files")
+  print_header
+  print_block "  Last 7 days" "$result" "$YELLOW"
+  echo ""
+}
+
+cmd_month() {
+  # Build list of all dates from start of month to today
+  local today
+  today=$(today_date)
+  local start
+  start=$(start_of_month)
+
+  # Count days between start and today
+  local dates=()
+  local i=0
+  while true; do
+    local d
+    d=$(days_ago "$i")
+    dates+=("$d")
+    [[ "$d" == "$start" ]] && break
+    (( i++ ))
+    (( i > 31 )) && break  # safety cap
+  done
+
+  local files
+  files=$(files_for_dates "${dates[@]}")
+  local result
+  result=$(aggregate_files "$files")
+  print_header
+  print_block "  This month  (since ${start})" "$result" "$MAGENTA"
+  echo ""
+}
+
+cmd_all() {
+  local files
+  files=$(all_files)
+  local result
+  result=$(aggregate_files "$files")
+  print_header
+  print_block "  All time" "$result" "$BLUE"
+  echo ""
+}
+
+cmd_summary() {
+  # Show today + week + month + all-time at once
+  local today
+  today=$(today_date)
+
+  # Today
+  local today_files
+  today_files=$(files_for_dates "$today")
+  local today_result
+  today_result=$(aggregate_files "$today_files")
+
+  # Week
+  local week_dates=()
+  for i in $(seq 0 6); do week_dates+=("$(days_ago "$i")"); done
+  local week_files
+  week_files=$(files_for_dates "${week_dates[@]}")
+  local week_result
+  week_result=$(aggregate_files "$week_files")
+
+  # Month
+  local start
+  start=$(start_of_month)
+  local month_dates=()
+  local i=0
+  while true; do
+    local d
+    d=$(days_ago "$i")
+    month_dates+=("$d")
+    [[ "$d" == "$start" ]] && break
+    (( i++ ))
+    (( i > 31 )) && break
+  done
+  local month_files
+  month_files=$(files_for_dates "${month_dates[@]}")
+  local month_result
+  month_result=$(aggregate_files "$month_files")
+
+  # All time
+  local all_files_list
+  all_files_list=$(all_files)
+  local all_result
+  all_result=$(aggregate_files "$all_files_list")
+
+  print_header
+  print_block "  Today  (${today})"             "$today_result"  "$GREEN"
+  echo ""
+  print_block "  This week  (last 7 days)"       "$week_result"   "$YELLOW"
+  echo ""
+  print_block "  This month  (since ${start})"   "$month_result"  "$MAGENTA"
+  echo ""
+  print_divider
+  print_block "  All time"                        "$all_result"    "$BLUE"
+  echo ""
+}
+
+cmd_history() {
+  local n="${1:-20}"
+  local all_files_list
+  all_files_list=$(all_files)
+
+  if [[ -z "$all_files_list" ]]; then
+    echo "No session data found."
+    exit 0
+  fi
+
+  print_header
+  echo -e "${BOLD}  Session history  (last ${n})${RESET}"
+  echo ""
+
+  # Collect all sessions, dedup, sort by timestamp desc, take N
+  local sessions_json
+  sessions_json=$(cat $all_files_list | jq -rs --argjson n "$n" '
+    group_by(.sid) | map(last)
+    | sort_by(.ts) | reverse
+    | .[0:$n]
+  ')
+
+  local count
+  count=$(echo "$sessions_json" | jq 'length')
+
+  if [[ "$count" -eq 0 ]]; then
+    echo "  No sessions recorded yet."
+    echo ""
+    return
+  fi
+
+  # Print table header
+  printf "  ${DIM}%-12s  %-8s  %-12s  %-10s  %-10s${RESET}\n" \
+    "Date" "Cost" "Input" "Output" "Duration"
+  echo -e "  ${DIM}$(printf '%.0s─' {1..54})${RESET}"
+
+  echo "$sessions_json" | jq -r '.[] |
+    [
+      .date,
+      (.cost // 0 | . * 10000 | round / 10000 | tostring),
+      (.in  // 0 | tostring),
+      (.out // 0 | tostring),
+      (.dur // 0 | tostring)
+    ] | @tsv
+  ' | while IFS=$'\t' read -r date cost in_tok out_tok dur_ms; do
+      local s=$(( ${dur_ms%.*} / 1000 ))
+      local dur_fmt
+      if   (( s >= 3600 )); then dur_fmt="$(( s/3600 ))h$(( (s%3600)/60 ))m"
+      elif (( s >= 60   )); then dur_fmt="$(( s/60 ))m$(( s%60 ))s"
+      else dur_fmt="${s}s"
+      fi
+      in_fmt=$(printf "%'d" "${in_tok%.*}" 2>/dev/null || echo "${in_tok%.*}")
+      out_fmt=$(printf "%'d" "${out_tok%.*}" 2>/dev/null || echo "${out_tok%.*}")
+      printf "  %-12s  \$%-7.4f  %-12s  %-10s  %s\n" \
+        "$date" "$cost" "$in_fmt" "$out_fmt" "$dur_fmt"
+  done
+
+  echo ""
+}
+
+cmd_reset() {
+  if [[ ! -d "$DATA_SUBDIR" ]]; then
+    echo "No data found at $DATA_SUBDIR"
+    exit 0
+  fi
+
+  local file_count
+  file_count=$(find "$DATA_SUBDIR" -name "*.jsonl" | wc -l | tr -d ' ')
+
+  if [[ "$file_count" -eq 0 ]]; then
+    echo "No session data to reset."
+    exit 0
+  fi
+
+  echo -e "${RED}${BOLD}Warning:${RESET} This will permanently delete ${file_count} day(s) of session data."
+  read -r -p "Are you sure? [y/N] " confirm
+  if [[ "$confirm" =~ ^[Yy]$ ]]; then
+    rm -f "$DATA_SUBDIR"/*.jsonl
+    echo "✓ Session data cleared."
+  else
+    echo "Cancelled."
+  fi
+}
+
+# ── Main dispatch ─────────────────────────────────────────────────────────────
+CMD="${1:-summary}"
+shift || true
+
+case "$CMD" in
+  today)                 cmd_today ;;
+  week)                  cmd_week ;;
+  month)                 cmd_month ;;
+  all | alltime)         cmd_all ;;
+  history)               cmd_history "${1:-20}" ;;
+  reset | clear)         cmd_reset ;;
+  summary | "")          cmd_summary ;;
+  -h | --help | help)
+    echo "Usage: claude-stats [today|week|month|all|history [N]|reset|summary]"
+    echo ""
+    echo "  (no args)      Today + week + month + all-time summary"
+    echo "  today          Today's usage"
+    echo "  week           Last 7 days"
+    echo "  month          This calendar month"
+    echo "  all            All-time totals"
+    echo "  history [N]    Last N sessions (default: 20)"
+    echo "  reset          Wipe all stored data"
+    echo ""
+    echo "Environment:"
+    echo "  CLAUDE_STATUS_DATA_DIR   Override data directory (default: ~/.local/share/claude-status)"
+    ;;
+  *)
+    echo "Unknown command: $CMD. Run 'claude-stats --help' for usage." >&2
+    exit 1
+    ;;
+esac
