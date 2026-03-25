@@ -5,17 +5,24 @@ Live Claude Code status line with token tracking, cost monitoring, and usage ana
 ## What it shows
 
 ```
-⎇ main  ·  lokesh  ·  sonnet-4-6  ·  $0.0123  ·  ↑5k ↓2k  ·  ctx:12%  ·  5h:8%  ·  2m30s
+⎇ main  ·  lokesh2021  ·  Sonnet 4.6  ·  $0.0123  ·  ↑5k ↓2k  ·  ctx [█░░░░░░░░░] 12%  ·  5h:8%  ·  2m30s
+```
+
+All data points fit on a single line when the terminal is wide enough, and automatically wrap to two lines on narrow terminals:
+
+```
+Sonnet 4.6  ·  $0.0123  ·  ↑5k ↓2k  ·  2m30s
+⎇ main  ·  lokesh2021  ·  ctx [███████████████░░░░░] 75%  ·  5h:8%
 ```
 
 | Field | Description |
 |---|---|
 | `⎇ main` | Current git branch |
-| `lokesh` | Your GitHub username (auto-detected, cached) |
-| `sonnet-4-6` | Active Claude model |
-| `$0.0123` | Session cost so far |
+| `lokesh2021` | Active GitHub account (auto-detected from `gh auth`, cached 7 days) |
+| `Sonnet 4.6` | Active Claude model |
+| `$0.0123` | Session cost so far (colour-coded: green → yellow → red) |
 | `↑5k ↓2k` | Input / output tokens this session |
-| `ctx:12%` | Context window used (shows `!` at 75%, `!!` at 90%) |
+| `ctx [█░░░░░░░░░] 12%` | Context window used with progress bar (colour-coded) |
 | `5h:8%` | 5-hour rate limit usage (hidden when 0%) |
 | `7d:3%` | 7-day rate limit usage (hidden when 0%) |
 | `2m30s` | Session wall-clock duration |
@@ -76,7 +83,7 @@ Example output:
 ```
   Claude Code Usage  · data: ~/.local/share/claude-status/data
   ────────────────────────────────────────────────────────
-  Today  (2026-03-24)
+  Today  (2026-03-25)
     Sessions     3
     Cost         $0.0847
     Input        45,231 tokens
@@ -118,10 +125,10 @@ Session data is stored as append-only JSONL files (one per day):
 
 ```
 ~/.local/share/claude-status/
-├── config.json              # cached GitHub username
+├── config.json              # cached GitHub username (refreshed every 7 days)
 └── data/
+    ├── 2026-03-25.jsonl
     ├── 2026-03-24.jsonl
-    ├── 2026-03-23.jsonl
     └── ...
 ```
 
@@ -132,18 +139,6 @@ Each line is a session snapshot. Sessions are deduplicated by `session_id` at re
 - **jq** — `brew install jq`
 - **git** (optional) — for branch display
 - **gh** (optional) — for GitHub username detection (`brew install gh`)
-
-## Publishing your own Homebrew tap
-
-1. Create a GitHub repo named exactly `homebrew-claude-status`
-2. Push this code to it
-3. Create a release tag: `git tag v1.0.0 && git push origin v1.0.0`
-4. The GitHub Action will build the release and update the formula SHA256 automatically
-5. Users can then install with:
-   ```bash
-   brew tap lokesh2021/claude-status
-   brew install claude-status
-   ```
 
 ## License
 
