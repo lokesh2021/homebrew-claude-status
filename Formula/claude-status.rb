@@ -2,10 +2,10 @@ class ClaudeStatus < Formula
   desc "Claude Code status line with live token tracking and usage analytics"
   homepage "https://github.com/lokesh2021/homebrew-claude-status"
   # Update url and sha256 after creating a GitHub release tag
-  url "https://github.com/lokesh2021/homebrew-claude-status/archive/refs/tags/v1.1.0.tar.gz"
-  sha256 "fd6e0acebbab9ec706a532f4c185f6d649380ac2c9135c12b63ed5e52edccc53"
+  url "https://github.com/lokesh2021/homebrew-claude-status/archive/refs/tags/v1.2.0.tar.gz"
+  sha256 "PLACEHOLDER"
   license "MIT"
-  version "1.0.0"
+  version "1.2.0"
 
   depends_on "jq"
 

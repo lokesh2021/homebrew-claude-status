@@ -113,6 +113,28 @@ Example output:
     Total        3,134,690 tokens
 ```
 
+## Game modes
+
+Reskin the status line with a themed overlay for fun. Switch modes with:
+
+```bash
+claude-status game             # show current mode + available modes
+claude-status game rpg         # switch to a mode
+claude-status game none        # back to default
+```
+
+| Mode | Preview |
+|---|---|
+| `none` | `⎇ main  ·  Sonnet 4.6  ·  $0.04  ·  ctx [████░░░░░░] 40%  ·  2m30s` |
+| `rpg` | `🧙 Lv.4  ·  HP [████████░░] 80%  ·  ⎇ main  ·  +5k XP  ·  💰$0.04` |
+| `space` | `🚀 M#12  ·  fuel [████████░░] 80%  ·  ⎇ main  ·  5k ly  ·  $0.04` |
+| `tamagotchi` | `🐱 lokesh2021  ·  😊  ·  fed [████░░░░░░] 40%  ·  2m30s  ·  $0.04` |
+| `dungeon` | `⚔️  F.12  ·  depth [████░░░░░░] 40%  ·  ⎇ main  ·  $0.04` |
+| `streaks` | `🔥 7d  ·  ⎇ main  ·  Sonnet 4.6  ·  $0.04  ·  ctx [████░░░░░░] 40%` |
+| `invader` | `ctx [····@·····] 40%  ·  ⎇ main  ·  Sonnet 4.6  ·  $0.04` |
+
+Each mode re-uses live session data — no extra tracking. Danger states activate at ≥90% context: HP/fuel bars turn red, dungeon shows `🐉 boss!`, tamagotchi becomes `😵`, invader fires `💥`. RPG level and mission/floor counts are derived from your all-time session history.
+
 ## Configuration
 
 | Environment variable | Default | Description |
@@ -125,7 +147,8 @@ Session data is stored as append-only JSONL files (one per day):
 
 ```
 ~/.local/share/claude-status/
-├── config.json              # cached GitHub username (refreshed every 7 days)
+├── config.json              # cached GitHub username + active game mode
+├── game_cache.json          # daily cache of all-time totals for game modes
 └── data/
     ├── 2026-03-25.jsonl
     ├── 2026-03-24.jsonl
@@ -137,8 +160,18 @@ Each line is a session snapshot. Sessions are deduplicated by `session_id` at re
 ## Requirements
 
 - **jq** — `brew install jq`
-- **git** (optional) — for branch display
+- **git** (optional) — for branch display and GitHub username detection from remotes
 - **gh** (optional) — for GitHub username detection (`brew install gh`)
+
+GitHub username is resolved automatically via multiple fallbacks — no manual configuration needed:
+
+| Priority | Source | Notes |
+|---|---|---|
+| 1 | `gh auth status` | Most accurate; respects multi-account setups |
+| 2 | `~/.config/gh/hosts.yml` | Works even without the `gh` binary installed |
+| 3 | `$GITHUB_USER` / `$GITHUB_ACTOR` | CI environments, devcontainers |
+| 4 | `git config --global github.user` | Set manually with `git config --global github.user <name>` |
+| 5 | `git remote get-url origin` | Parsed from the current repo's GitHub remote URL |
 
 ## License
 

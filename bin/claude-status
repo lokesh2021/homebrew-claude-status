@@ -28,12 +28,46 @@ WHITE=$'\033[97m'   # bright white  — model
 DATA_DIR="${CLAUDE_STATUS_DATA_DIR:-$HOME/.local/share/claude-status}"
 CONFIG_FILE="$DATA_DIR/config.json"
 DATA_SUBDIR="$DATA_DIR/data"
+GAME_CACHE_FILE="$DATA_DIR/game_cache.json"
 mkdir -p "$DATA_SUBDIR"
 
 # ── Guard: require jq ─────────────────────────────────────────────────────────
 if ! command -v jq &>/dev/null; then
   echo "⚠ claude-status: jq not found (brew install jq)"
   exit 0
+fi
+
+# ── Game-mode CLI handler (defined early so it can exit before reading stdin) ─
+VALID_GAME_MODES="none rpg space tamagotchi dungeon streaks invader"
+handle_game_cmd() {
+  if [[ $# -eq 0 ]] || [[ "$1" == "list" ]]; then
+    local mode="none"
+    [[ -f "$CONFIG_FILE" ]] && \
+      mode=$(jq -r '.game_mode // "none"' "$CONFIG_FILE" 2>/dev/null || echo "none")
+    echo "Current game mode: $mode"
+    echo "Available modes:   $VALID_GAME_MODES"
+    return 0
+  fi
+  local new_mode="$1"
+  if [[ ! " $VALID_GAME_MODES " =~ " $new_mode " ]]; then
+    echo "Unknown mode: $new_mode" >&2
+    echo "Available:    $VALID_GAME_MODES" >&2
+    return 1
+  fi
+  local tmp; tmp=$(mktemp)
+  if [[ -f "$CONFIG_FILE" ]]; then
+    jq --arg m "$new_mode" '.game_mode = $m' "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
+  else
+    printf '{"game_mode":"%s"}\n' "$new_mode" > "$CONFIG_FILE"
+  fi
+  echo "Game mode set to: $new_mode"
+}
+
+if [[ $# -gt 0 ]]; then
+  case "$1" in
+    game) handle_game_cmd "${@:2}"; exit $? ;;
+    *)    echo "Usage: claude-status game [mode|list]" >&2; exit 1 ;;
+  esac
 fi
 
 # ── Read + parse JSON input (single jq call for speed) ───────────────────────
@@ -69,31 +103,68 @@ if command -v git &>/dev/null && git rev-parse --is-inside-work-tree &>/dev/null
     || true)
 fi
 
-# ── GitHub username (cached for 7 days; only from `gh auth`, never git config) ─
+# ── GitHub username — tried in order, first non-empty result wins ──────────────
 GH_USER=""
-CACHE_TTL=$(( 7 * 86400 ))
-if [[ -f "$CONFIG_FILE" ]]; then
-  CACHED_USER=$(jq -r '.github_username // ""' "$CONFIG_FILE" 2>/dev/null || true)
-  CACHED_TS=$(jq -r '.updated // 0'           "$CONFIG_FILE" 2>/dev/null || true)
-  NOW=$(date +%s)
-  if [[ -n "$CACHED_USER" ]] && (( NOW - CACHED_TS < CACHE_TTL )); then
-    GH_USER="$CACHED_USER"
-  fi
-fi
 
+# 1. gh CLI active account (most authoritative; respects multi-account setups)
 if [[ -z "$GH_USER" ]] && command -v gh &>/dev/null; then
-  # Use the active account from gh auth status (respects multi-account setups)
   GH_USER=$(gh auth status 2>/dev/null \
     | grep -B3 'Active account: true' \
     | grep 'Logged in to' \
     | sed 's/.*account \([^ ]*\).*/\1/')
-  # Fallback to gh api user if auth status parsing yields nothing
   [[ -z "$GH_USER" ]] && GH_USER=$(gh api user --jq '.login' 2>/dev/null || true)
-  if [[ -n "$GH_USER" ]]; then
+fi
+
+# 2. gh config file (~/.config/gh/hosts.yml) — works without the gh binary
+if [[ -z "$GH_USER" ]]; then
+  _gh_hosts="${XDG_CONFIG_HOME:-$HOME/.config}/gh/hosts.yml"
+  if [[ -f "$_gh_hosts" ]]; then
+    GH_USER=$(grep -A5 'github.com' "$_gh_hosts" \
+      | grep '^\s*user:' \
+      | head -1 \
+      | sed 's/.*user:[[:space:]]*//' \
+      | tr -d '"' )
+  fi
+  unset _gh_hosts
+fi
+
+# 3. Environment variables (common in CI / devcontainers)
+if [[ -z "$GH_USER" ]]; then
+  GH_USER="${GITHUB_USER:-${GITHUB_ACTOR:-}}"
+fi
+
+# 4. git config github.user (explicit user convention)
+if [[ -z "$GH_USER" ]] && command -v git &>/dev/null; then
+  GH_USER=$(git config --global github.user 2>/dev/null || true)
+fi
+
+# 5. Parse owner from GitHub remote URL of current repo
+if [[ -z "$GH_USER" ]] && command -v git &>/dev/null \
+    && git rev-parse --is-inside-work-tree &>/dev/null 2>&1; then
+  _remote_url=$(git remote get-url origin 2>/dev/null || true)
+  # Handles https://github.com/USER/repo and git@github.com:USER/repo
+  GH_USER=$(printf "%s" "$_remote_url" \
+    | sed -n 's|.*github\.com[:/]\([^/]*\)/.*|\1|p')
+  unset _remote_url
+fi
+
+if [[ -n "$GH_USER" ]]; then
+  _cfg_tmp=$(mktemp)
+  if [[ -f "$CONFIG_FILE" ]]; then
+    jq --arg u "$GH_USER" --argjson ts "$(date +%s)" \
+      '.github_username = $u | .updated = $ts' "$CONFIG_FILE" > "$_cfg_tmp" \
+      && mv "$_cfg_tmp" "$CONFIG_FILE"
+  else
     printf '{"github_username":"%s","updated":%s}\n' \
       "$GH_USER" "$(date +%s)" > "$CONFIG_FILE"
   fi
+  unset _cfg_tmp
 fi
+
+# ── Load game mode from config ────────────────────────────────────────────────
+GAME_MODE="none"
+[[ -f "$CONFIG_FILE" ]] && \
+  GAME_MODE=$(jq -r '.game_mode // "none"' "$CONFIG_FILE" 2>/dev/null || echo "none")
 
 # ── Persist session data (append-log; deduped by session_id on read) ──────────
 if [[ -n "$SESSION_ID" ]]; then
@@ -192,6 +263,133 @@ join_segs() {
   printf "%s" "$out"
 }
 
+# Return colour code for HP/fuel values (inverted: low = red, high = green)
+hp_colour() {
+  local v="${1:-0}"; v="${v%.*}"; v="${v:-0}"
+  if   (( v <= 10 )); then printf "%s" "$BRED"
+  elif (( v <= 25 )); then printf "%s" "$BYELLOW"
+  else printf "%s" "$BGREEN"
+  fi
+}
+
+# Progress bar using hp_colour (for HP/fuel where low pct is bad)
+make_bar_hp() {
+  local pct="${1:-0}"; pct="${pct%.*}"; pct="${pct:-0}"
+  local w="${2:-10}"
+  local filled=$(( pct * w / 100 ))
+  (( filled > w )) && filled=$w
+  local empty=$(( w - filled ))
+  local colour; colour=$(hp_colour "$pct")
+  local out="${colour}"
+  local i
+  for (( i=0; i<filled; i++ )); do out+="█"; done
+  out+="${DIM}"
+  for (( i=0; i<empty; i++ )); do out+="░"; done
+  out+="${R}"
+  printf "%s" "$out"
+}
+
+# ── Game helper functions ─────────────────────────────────────────────────────
+
+# Cross-platform: date N days ago as YYYY-MM-DD
+days_ago_date() {
+  local n="$1"
+  date -d "today - $n days" +%Y-%m-%d 2>/dev/null \
+    || date -v-${n}d +%Y-%m-%d 2>/dev/null \
+    || true
+}
+
+# Walk backwards from today counting consecutive days with session data
+compute_streak() {
+  local today; today=$(date +%Y-%m-%d)
+  local streak=0 i=0
+  while true; do
+    local check_date
+    if (( i == 0 )); then
+      check_date="$today"
+    else
+      check_date=$(days_ago_date "$i")
+      [[ -z "$check_date" ]] && break
+    fi
+    local file="$DATA_SUBDIR/${check_date}.jsonl"
+    if [[ -f "$file" ]] && [[ -s "$file" ]]; then
+      (( streak++ )); (( i++ ))
+    else
+      break
+    fi
+  done
+  echo "$streak"
+}
+
+# Load game cache (daily refresh); sets GAME_TOTAL_TOKENS, GAME_TOTAL_SESSIONS, GAME_STREAK
+load_game_cache() {
+  local today; today=$(date +%Y-%m-%d)
+  if [[ -f "$GAME_CACHE_FILE" ]]; then
+    local cache_date
+    cache_date=$(jq -r '.cache_date // ""' "$GAME_CACHE_FILE" 2>/dev/null || true)
+    if [[ "$cache_date" == "$today" ]]; then
+      GAME_TOTAL_TOKENS=$(jq -r '.total_tokens // 0' "$GAME_CACHE_FILE")
+      GAME_TOTAL_SESSIONS=$(jq -r '.total_sessions // 0' "$GAME_CACHE_FILE")
+      GAME_STREAK=$(jq -r '.streak_days // 0' "$GAME_CACHE_FILE")
+      return
+    fi
+  fi
+  # Recompute from all JSONL files
+  local all_tokens=0 all_sessions=0
+  local data_files=( "$DATA_SUBDIR"/*.jsonl )
+  if [[ -f "${data_files[0]}" ]]; then
+    local agg
+    agg=$(cat "${data_files[@]}" | jq -rs '
+      group_by(.sid) | map(last) |
+      { total_tokens: (map((.in//0)+(.out//0)) | add // 0),
+        total_sessions: length }
+    ' 2>/dev/null || echo '{"total_tokens":0,"total_sessions":0}')
+    all_tokens=$(printf "%s" "$agg" | jq -r '.total_tokens // 0')
+    all_sessions=$(printf "%s" "$agg" | jq -r '.total_sessions // 0')
+  fi
+  local streak; streak=$(compute_streak)
+  printf '{"total_tokens":%s,"total_sessions":%s,"streak_days":%s,"cache_date":"%s"}\n' \
+    "$all_tokens" "$all_sessions" "$streak" "$today" > "$GAME_CACHE_FILE"
+  GAME_TOTAL_TOKENS="$all_tokens"
+  GAME_TOTAL_SESSIONS="$all_sessions"
+  GAME_STREAK="$streak"
+}
+
+# Map all-time token count to RPG level 1–10
+rpg_level() {
+  local t="${1:-0}"; t="${t%.*}"; t="${t:-0}"
+  if   (( t >= 20000000 )); then echo 10
+  elif (( t >= 10000000 )); then echo 9
+  elif (( t >=  5000000 )); then echo 8
+  elif (( t >=  2000000 )); then echo 7
+  elif (( t >=  1000000 )); then echo 6
+  elif (( t >=   500000 )); then echo 5
+  elif (( t >=   200000 )); then echo 4
+  elif (( t >=    50000 )); then echo 3
+  elif (( t >=    10000 )); then echo 2
+  else echo 1
+  fi
+}
+
+# Invader bar: lone character marches right as ctx fills; danger state at ≥90%
+make_bar_invader() {
+  local pct="${1:-0}"; pct="${pct%.*}"; pct="${pct:-0}"
+  local w="${2:-10}"
+  local pos=$(( pct * w / 100 ))
+  (( pos >= w )) && pos=$(( w - 1 ))
+  local icon colour
+  if (( pct >= 90 )); then icon="!"; colour="$BRED"
+  else icon="@"; colour="$BGREEN"
+  fi
+  local out="" i
+  for (( i=0; i<w; i++ )); do
+    if (( i == pos )); then out+="${colour}${icon}${R}"
+    else out+="${DIM}·${R}"
+    fi
+  done
+  printf "%s" "$out"
+}
+
 # ── Normalise parsed values ───────────────────────────────────────────────────
 CTX="${CTX_PCT%.*}";  CTX="${CTX:-0}"
 RATE="${RATE_5H%.*}"; RATE="${RATE:-0}"
@@ -254,23 +452,160 @@ visible_len() {
   printf "%d" $(( total - cont ))
 }
 
-# ── Layout ────────────────────────────────────────────────────────────────────
-#
-# Single line when it fits; two lines only when the terminal is too narrow.
-#   Single — ⎇ branch  ·  user  ·  model  ·  $cost  ·  ↑in ↓out  ·  ctx [████░] 40%  ·  5h:x%  ·  7d:x%  ·  dur
-#   Line 1 — model  ·  $cost  ·  ↑in ↓out  ·  dur
-#   Line 2 — ⎇ branch  ·  user  ·  ctx [███████████████░░░░░] 75%  ·  5h:x%  ·  7d:x%
+# ── Render functions ──────────────────────────────────────────────────────────
 
-CTX_SEG=$(ctx_seg 10)
-SINGLE=$(join_segs "$SEG_BRANCH" "$SEG_USER" "$SEG_MODEL" \
-         "$SEG_COST" "$SEG_TOKENS" \
-         "$CTX_SEG" "$SEG_RATE5" "$SEG_RATE7" "$SEG_DUR")
+render_standard() {
+  # Single line when it fits; two lines only when the terminal is too narrow.
+  #   Single — ⎇ branch  ·  user  ·  model  ·  $cost  ·  ↑in ↓out  ·  ctx [████░] 40%  ·  5h:x%  ·  7d:x%  ·  dur
+  #   Line 1 — model  ·  $cost  ·  ↑in ↓out  ·  dur
+  #   Line 2 — ⎇ branch  ·  user  ·  ctx [███████████████░░░░░] 75%  ·  5h:x%  ·  7d:x%
+  local CTX_SEG SINGLE LINE1 LINE2
+  CTX_SEG=$(ctx_seg 10)
+  SINGLE=$(join_segs "$SEG_BRANCH" "$SEG_USER" "$SEG_MODEL" \
+           "$SEG_COST" "$SEG_TOKENS" \
+           "$CTX_SEG" "$SEG_RATE5" "$SEG_RATE7" "$SEG_DUR")
+  if (( $(visible_len "$SINGLE") <= TERM_WIDTH )); then
+    printf "%s\n" "$SINGLE"
+  else
+    LINE1=$(join_segs "$SEG_MODEL" "$SEG_COST" "$SEG_TOKENS" "$SEG_DUR")
+    CTX_SEG=$(ctx_seg 15)
+    LINE2=$(join_segs "$SEG_BRANCH" "$SEG_USER" "$CTX_SEG" "$SEG_RATE5" "$SEG_RATE7")
+    printf "%s\n%s\n" "$LINE1" "$LINE2"
+  fi
+}
 
-if (( $(visible_len "$SINGLE") <= TERM_WIDTH )); then
-  printf "%s\n" "$SINGLE"
-else
-  LINE1=$(join_segs "$SEG_MODEL" "$SEG_COST" "$SEG_TOKENS" "$SEG_DUR")
-  CTX_SEG=$(ctx_seg 15)
-  LINE2=$(join_segs "$SEG_BRANCH" "$SEG_USER" "$CTX_SEG" "$SEG_RATE5" "$SEG_RATE7")
-  printf "%s\n%s\n" "$LINE1" "$LINE2"
-fi
+render_rpg() {
+  load_game_cache
+  local lvl; lvl=$(rpg_level "$GAME_TOTAL_TOKENS")
+  local hp=$(( 100 - CTX ))
+  local hp_bar; hp_bar=$(make_bar_hp "$hp" 10)
+  local hc; hc=$(hp_colour "$hp")
+  local xp_fmt; xp_fmt=$(fmt_tokens "$(( IN_TOK + OUT_TOK ))")
+  local SEG_CHAR="${BOLD}${WHITE}🧙 Lv.${lvl}${R}"
+  local SEG_HP="HP [${hp_bar}] ${hc}${hp}%${R}"
+  local SEG_XP="${BGREEN}+${xp_fmt} XP${R}"
+  local SEG_GOLD="${CC}💰$(fmt_cost "$COST")${R}"
+  local SINGLE LINE1 LINE2
+  SINGLE=$(join_segs "$SEG_CHAR" "$SEG_HP" "$SEG_BRANCH" "$SEG_XP" "$SEG_GOLD" "$SEG_DUR")
+  if (( $(visible_len "$SINGLE") <= TERM_WIDTH )); then
+    printf "%s\n" "$SINGLE"
+  else
+    LINE1=$(join_segs "$SEG_CHAR" "$SEG_GOLD" "$SEG_DUR")
+    LINE2=$(join_segs "$SEG_HP" "$SEG_BRANCH" "$SEG_XP")
+    printf "%s\n%s\n" "$LINE1" "$LINE2"
+  fi
+}
+
+render_space() {
+  load_game_cache
+  local fuel=$(( 100 - CTX ))
+  local fuel_bar; fuel_bar=$(make_bar_hp "$fuel" 10)
+  local fc; fc=$(hp_colour "$fuel")
+  local dist; dist=$(fmt_tokens "$IN_TOK")
+  local mission="$GAME_TOTAL_SESSIONS"
+  local SEG_SHIP="${BOLD}${WHITE}🚀 M#${mission}${R}"
+  local SEG_FUEL="fuel [${fuel_bar}] ${fc}${fuel}%${R}"
+  local SEG_DIST="${BCYAN}${dist} ly${R}"
+  local SINGLE LINE1 LINE2
+  SINGLE=$(join_segs "$SEG_SHIP" "$SEG_FUEL" "$SEG_BRANCH" "$SEG_DIST" "$SEG_COST" "$SEG_DUR")
+  if (( $(visible_len "$SINGLE") <= TERM_WIDTH )); then
+    printf "%s\n" "$SINGLE"
+  else
+    LINE1=$(join_segs "$SEG_SHIP" "$SEG_COST" "$SEG_DUR")
+    LINE2=$(join_segs "$SEG_FUEL" "$SEG_BRANCH" "$SEG_DIST")
+    printf "%s\n%s\n" "$LINE1" "$LINE2"
+  fi
+}
+
+render_tamagotchi() {
+  local mood
+  if   (( CTX >= 90 )); then mood="😵"
+  elif (( CTX >= 75 )); then mood="😴"
+  elif (( CTX >= 50 )); then mood="😐"
+  else mood="😊"
+  fi
+  local pet_name="${GH_USER:-Claude}"
+  local fed_bar; fed_bar=$(make_bar "$CTX" 10)
+  local pc; pc=$(pct_colour "$CTX")
+  local SEG_PET="${BOLD}${WHITE}🐱 ${pet_name}${R}"
+  local SEG_MOOD="$mood"
+  local SEG_FED="fed [${fed_bar}] ${pc}${CTX}%${R}"
+  local SINGLE LINE1 LINE2
+  SINGLE=$(join_segs "$SEG_PET" "$SEG_MOOD" "$SEG_FED" "$SEG_DUR" "$SEG_COST")
+  if (( $(visible_len "$SINGLE") <= TERM_WIDTH )); then
+    printf "%s\n" "$SINGLE"
+  else
+    LINE1=$(join_segs "$SEG_PET" "$SEG_MOOD" "$SEG_COST")
+    LINE2=$(join_segs "$SEG_FED" "$SEG_DUR")
+    printf "%s\n%s\n" "$LINE1" "$LINE2"
+  fi
+}
+
+render_dungeon() {
+  load_game_cache
+  local floor="$GAME_TOTAL_SESSIONS"
+  local depth_bar; depth_bar=$(make_bar "$CTX" 10)
+  local pc; pc=$(pct_colour "$CTX")
+  local boss_warn=""
+  (( CTX >= 90 )) && boss_warn="${BRED}🐉 boss!${R}"
+  local SEG_DUNGEON="${BOLD}${WHITE}⚔️  F.${floor}${R}"
+  local SEG_DEPTH="depth [${depth_bar}] ${pc}${CTX}%${R}"
+  local SINGLE LINE1 LINE2
+  SINGLE=$(join_segs "$SEG_DUNGEON" "$SEG_DEPTH" "$SEG_BRANCH" "$boss_warn" "$SEG_COST" "$SEG_DUR")
+  if (( $(visible_len "$SINGLE") <= TERM_WIDTH )); then
+    printf "%s\n" "$SINGLE"
+  else
+    LINE1=$(join_segs "$SEG_DUNGEON" "$SEG_COST" "$SEG_DUR")
+    LINE2=$(join_segs "$SEG_DEPTH" "$SEG_BRANCH" "$boss_warn")
+    printf "%s\n%s\n" "$LINE1" "$LINE2"
+  fi
+}
+
+render_streaks() {
+  load_game_cache
+  local streak="$GAME_STREAK"
+  local SEG_STREAK="${BYELLOW}🔥 ${streak}d${R}"
+  local CTX_SEG SINGLE LINE1 LINE2
+  CTX_SEG=$(ctx_seg 10)
+  SINGLE=$(join_segs "$SEG_STREAK" "$SEG_BRANCH" "$SEG_MODEL" \
+           "$SEG_COST" "$CTX_SEG" "$SEG_RATE5" "$SEG_RATE7" "$SEG_DUR")
+  if (( $(visible_len "$SINGLE") <= TERM_WIDTH )); then
+    printf "%s\n" "$SINGLE"
+  else
+    LINE1=$(join_segs "$SEG_STREAK" "$SEG_MODEL" "$SEG_COST" "$SEG_DUR")
+    CTX_SEG=$(ctx_seg 15)
+    LINE2=$(join_segs "$SEG_BRANCH" "$CTX_SEG" "$SEG_RATE5" "$SEG_RATE7")
+    printf "%s\n%s\n" "$LINE1" "$LINE2"
+  fi
+}
+
+render_invader() {
+  local inv_bar; inv_bar=$(make_bar_invader "$CTX" 10)
+  local pc; pc=$(pct_colour "$CTX")
+  local danger=""
+  (( CTX >= 90 )) && danger=" 💥"
+  local SEG_INV="ctx [${inv_bar}] ${pc}${CTX}%${R}${danger}"
+  local SINGLE LINE1 LINE2
+  SINGLE=$(join_segs "$SEG_INV" "$SEG_BRANCH" "$SEG_MODEL" \
+           "$SEG_COST" "$SEG_TOKENS" "$SEG_RATE5" "$SEG_RATE7" "$SEG_DUR")
+  if (( $(visible_len "$SINGLE") <= TERM_WIDTH )); then
+    printf "%s\n" "$SINGLE"
+  else
+    local inv_bar2; inv_bar2=$(make_bar_invader "$CTX" 15)
+    SEG_INV="ctx [${inv_bar2}] ${pc}${CTX}%${R}${danger}"
+    LINE1=$(join_segs "$SEG_MODEL" "$SEG_COST" "$SEG_TOKENS" "$SEG_DUR")
+    LINE2=$(join_segs "$SEG_BRANCH" "$SEG_INV" "$SEG_RATE5" "$SEG_RATE7")
+    printf "%s\n%s\n" "$LINE1" "$LINE2"
+  fi
+}
+
+# ── Dispatch based on game mode ───────────────────────────────────────────────
+case "$GAME_MODE" in
+  rpg)        render_rpg ;;
+  space)      render_space ;;
+  tamagotchi) render_tamagotchi ;;
+  dungeon)    render_dungeon ;;
+  streaks)    render_streaks ;;
+  invader)    render_invader ;;
+  *)          render_standard ;;
+esac
