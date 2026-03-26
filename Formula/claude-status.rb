@@ -3,7 +3,7 @@ class ClaudeStatus < Formula
   homepage "https://github.com/lokesh2021/homebrew-claude-status"
   # Update url and sha256 after creating a GitHub release tag
   url "https://github.com/lokesh2021/homebrew-claude-status/archive/refs/tags/v1.2.0.tar.gz"
-  sha256 "PLACEHOLDER"
+  sha256 "4288fa29ff8f3c6cade9acacadf0ebac7643e7d1aeddc33571df5b3a06c458fb"
   license "MIT"
   version "1.2.0"
 
